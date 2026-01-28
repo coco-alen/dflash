@@ -25,14 +25,18 @@ def extract_context_feature(
     target_hidden = torch.cat(selected_states, dim=-1)
     return target_hidden
 
-def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+def sample(logits: torch.Tensor, temperature: float = 0.0, topk: int = 1) -> torch.Tensor:
     if temperature < 1e-5:
-        return torch.argmax(logits, dim=-1)
+        if topk == 1:
+            return torch.argmax(logits, dim=-1)
+        else:
+            return torch.topk(logits, k=topk, dim=-1).indices
     bsz, seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size)
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+    probs = torch.multinomial(probs, num_samples=1)
+    return probs.view(bsz, seq_len)
 
 def load_and_process_dataset(data_name: str):
     # Math datasets
