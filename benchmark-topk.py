@@ -12,6 +12,8 @@ from model import DFlashDraftModel, sample, load_and_process_dataset, extract_co
 import distributed as dist
 from copy import deepcopy
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 def cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
@@ -65,6 +67,7 @@ def dflash_generate(
     draft_prefill = True
 
     topk = 15
+    topk_iters = 1
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -86,25 +89,23 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = cuda_time()
 
-        past_key_values_target_snapshot = deepcopy(past_key_values_target)
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target_snapshot,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
+            past_key_values_target_snapshot = deepcopy(past_key_values_target)
+            output = target(
+                block_output_ids,
+                position_ids=block_position_ids,
+                past_key_values=past_key_values_target_snapshot,
+                use_cache=True,
+                output_hidden_states=True if block_size > 1 else False,
+            )
 
-        posterior = sample(output.logits, temperature)
-        # # acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        # acceptance_length = (draft_ids == posterior[:, :-1].unsqueeze(-1)).any(dim=-1).cumprod(dim=1).sum(dim=1)[0].item()  # [bsz, seq_len-1]
-        seq_len = block_output_ids.shape[1] - 1
-        acceptance_length = 0
-        for i in range(seq_len):
-            if torch.isin(posterior[:, i], draft_ids[:, i]):
-                block_output_ids[:, i+1] = posterior[:, i]
-            else:
-                break
+            posterior = sample(output.logits, temperature)
+            seq_len = block_output_ids.shape[1] - 1
+            acceptance_length = 0
+            for i in range(seq_len):
+                if torch.isin(posterior[:, i], draft_ids[:, i]):
+                    block_output_ids[:, i+1] = posterior[:, i]
+                else:
+                    break
 
         output = target(
             block_output_ids,
