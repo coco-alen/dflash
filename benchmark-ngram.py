@@ -313,7 +313,9 @@ def main() -> None:
         print(dflash_text)
 
     print(f"Decoding speedup: {t1 / tb:.2f}")
-
+    print("Oringianl output throughput: "
+          f"{1 / t1:.2f} tokens/sec, "
+          f"D-Flash output throughput: {1 / tb:.2f} tokens/sec")
     tau = np.mean([np.mean(r[args.block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
 

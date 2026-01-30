@@ -209,6 +209,9 @@ def main() -> None:
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[args.block_size].time_per_output_token for r in responses])
     print(f"Decoding speedup: {t1 / tb:.2f}")
+    print("Oringianl output throughput: "
+          f"{1 / t1:.2f} tokens/sec, "
+          f"D-Flash output throughput: {1 / tb:.2f} tokens/sec")
 
     tau = np.mean([np.mean(r[args.block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
