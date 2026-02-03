@@ -70,6 +70,10 @@ def load_and_process_dataset(data_name: str):
         dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
         dataset = dataset.map(lambda x: {"turns": x["prompt"]})
 
+    elif data_name == "sharegpt":
+        dataset = load_dataset("sharegpt/sharegpt", split="train")
+        dataset = dataset.map(lambda x: {"turns": [m["content"] for m in x["conversations"]]})
+
     # Coding datasets
     elif data_name == "humaneval":
         dataset = load_dataset("openai/openai_humaneval", split="test")

@@ -14,9 +14,16 @@ from copy import deepcopy
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
+import medusa
+
 def cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
+
+
+def print_ids(tokenizer: AutoTokenizer, ids: torch.Tensor, prefix = "message:") -> None:
+    text = tokenizer.decode(ids[0], skip_special_tokens=False)
+    print(f"{prefix}: {text}")
 
 @torch.inference_mode()
 def dflash_generate(
@@ -28,6 +35,7 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    tokenizer: AutoTokenizer = None,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -60,6 +68,9 @@ def dflash_generate(
 
     time_to_first_token = cuda_time() - prefill_start
 
+    if block_size > 1:
+        medusa_buffers = medusa.generate_medusa_buffers(medusa.dflash_choice, device=model.device)
+        medusa_attn_mask = medusa_buffers["medusa_attn_mask"].unsqueeze(0).unsqueeze(0).repeat(1, 32, 1, 1)
     # Decode stage
     decode_start = cuda_time()
     start = input_ids.shape[1]
@@ -85,44 +96,97 @@ def dflash_generate(
             past_key_values_draft.crop(start)
             draft_ids = sample(draft_logits, topk=topk)
             block_output_ids[:, 1:] = draft_ids[:,:,0]
+            # print('=' * 20)
+            # for i in range(draft_ids.size(2)):
+            #     print_ids(tokenizer, torch.cat([block_output_ids[:, :1], draft_ids[:,:,i]], dim=1), prefix=f"[yellow]Draft top{i+1} at position {start}[/yellow]")
+            # print('=' * 20)
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
 
-            past_key_values_target_snapshot = deepcopy(past_key_values_target)
+            # past_key_values_target_snapshot = deepcopy(past_key_values_target)
+            # output = target(
+            #     block_output_ids,
+            #     position_ids=block_position_ids,
+            #     past_key_values=past_key_values_target_snapshot,
+            #     use_cache=True,
+            #     output_hidden_states=True if block_size > 1 else False,
+            # )
+
+            # posterior = sample(output.logits, temperature)
+            # # print_ids(tokenizer, torch.cat([block_output_ids[:, :1], posterior[:,1:]], dim=1), prefix=f"[green]Posterior at position {start}[/green]")
+            # seq_len = block_output_ids.shape[1] - 1
+            # acceptance_length = 0
+            # for i in range(seq_len):
+            #     if torch.isin(posterior[:, i], draft_ids[:, i]):
+            #         block_output_ids[:, i+1] = posterior[:, i]
+            #         # # 打印posterior[:, i]是在draft_ids[:, i]的第几个
+            #         # index_in_draft = (draft_ids[:, i] == posterior[:, i])[0].nonzero(as_tuple=True)[0].item()
+            #         # print(f"[blue]Accepted token at position {i}, index in draft: {index_in_draft}[/blue]")
+            #     else:
+            #         break
+
+            cart_candidates, tree_candidates = medusa.generate_candidates(
+                draft_ids=draft_ids,
+                verified_ids=block_output_ids[:, :1],
+                tree_indices=medusa_buffers["tree_indices"],
+                retrieve_indices=medusa_buffers["retrieve_indices"],
+            )
+            print("cart_candidates shape:", cart_candidates.shape)
+            print("tree_candidates shape:", tree_candidates.shape)
+            print("medusa_attn_mask shape:",medusa_attn_mask.shape)
+            block_position_ids = (medusa_buffers["medusa_position_ids"] + start).unsqueeze(0)
+            block_output_ids = tree_candidates
+            attention_mask = torch.cat([torch.ones((1, 32, medusa_attn_mask.shape[2], start), device=medusa_attn_mask.device), medusa_attn_mask], dim=3)
+
             output = target(
                 block_output_ids,
                 position_ids=block_position_ids,
-                past_key_values=past_key_values_target_snapshot,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                attention_mask=attention_mask,
+                output_hidden_states=True if block_size > 1 else False,
+            )
+            target_logits = output.logits[0, medusa_buffers["retrieve_indices"]]
+            posterior = sample(target_logits, temperature)
+            print("posterior shape:", posterior.shape)
+            acceptance_mask = (cart_candidates[0, :, 1:] == posterior[:, :-1]).int()
+            candidates_accept_length = (torch.cumprod(acceptance_mask, dim=1)).sum(dim=1)
+            print("candidates_accept_length:", candidates_accept_length)
+            accept_length = candidates_accept_length.max()
+            if accept_length > 0:
+                best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+                block_output_ids[:, : accept_length + 1] = cart_candidates[:, best_candidate, : accept_length + 1]
+                select_indices = (
+                    medusa_buffers["retrieve_indices"][best_candidate, : accept_length + 1] + start
+                )
+                output_ids[:, start : start + accept_length + 1] = block_output_ids[:, : accept_length + 1]
+                output_ids[:, start + accept_length + 1] = posterior[best_candidate, accept_length]
+                acceptance_lengths.append(accept_length + 1)
+                start += accept_length + 1
+                past_key_values_target.batch_select_indices(select_indices)
+                print(output.hidden_states.shape)
+
+        else:
+            output = target(
+                block_output_ids,
+                position_ids=block_position_ids,
+                past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True if block_size > 1 else False,
             )
-
             posterior = sample(output.logits, temperature)
-            seq_len = block_output_ids.shape[1] - 1
-            acceptance_length = 0
-            for i in range(seq_len):
-                if torch.isin(posterior[:, i], draft_ids[:, i]):
-                    block_output_ids[:, i+1] = posterior[:, i]
-                else:
-                    break
+            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            # if acceptance_length == block_size - 1:
+            #     print_ids(tokenizer, block_output_ids, prefix=f"[blue]Fully accepted block at position {start}[/blue]")
 
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+            output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+            acceptance_lengths.append(acceptance_length+1)
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
 
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
         
@@ -177,7 +241,7 @@ def main() -> None:
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
@@ -207,7 +271,7 @@ def main() -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for block_size in [1, args.block_size]:
+            for block_size in [args.block_size]:
                 response[block_size] = dflash_generate(
                     model=draft_model,
                     target=target,
@@ -217,6 +281,7 @@ def main() -> None:
                     block_size=block_size,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
+                    tokenizer=tokenizer,
                 )
             
             spec_response = response[args.block_size]
@@ -234,18 +299,18 @@ def main() -> None:
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[args.block_size].time_per_output_token for r in responses])
 
-    for each_res in responses:
-        print("=================================")
-        # decode output
-        print("-------- original output ---------")
-        original_ids = each_res[1].output_ids[0, each_res[1].num_input_tokens:]
-        original_text = tokenizer.decode(original_ids, skip_special_tokens=False)
-        print(original_text)
+    # for each_res in responses:
+    #     print("=================================")
+    #     # decode output
+    #     print("-------- original output ---------")
+    #     original_ids = each_res[1].output_ids[0, each_res[1].num_input_tokens:]
+    #     original_text = tokenizer.decode(original_ids, skip_special_tokens=False)
+    #     print(original_text)
 
-        print("-------- dflash output ---------")
-        dflash_ids = each_res[args.block_size].output_ids[0, each_res[args.block_size].num_input_tokens:]
-        dflash_text = tokenizer.decode(dflash_ids, skip_special_tokens=False)
-        print(dflash_text)
+    #     print("-------- dflash output ---------")
+    #     dflash_ids = each_res[args.block_size].output_ids[0, each_res[args.block_size].num_input_tokens:]
+    #     dflash_text = tokenizer.decode(dflash_ids, skip_special_tokens=False)
+    #     print(dflash_text)
 
     print(f"Decoding speedup: {t1 / tb:.2f}")
     print("Oringianl output throughput: "
